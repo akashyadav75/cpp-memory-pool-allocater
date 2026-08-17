@@ -1,0 +1,38 @@
+name: CMake Build & Test CI/CD
+
+# Why this CI/CD pipeline?
+# - Automatically verifies code compilation, code quality, and test suite execution
+#   across multiple platforms (Windows and Ubuntu Linux) on every push or pull request.
+# - Ensures that our Windows-specific VirtualAlloc APIs and our fallback Linux-specific
+#   mmap APIs remain compliant and functional.
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    name: Build & Test on ${{ matrix.os }} (${{ matrix.build_type }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        build_type: [Release, Debug]
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+
+    - name: Configure CMake
+      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -S ${{github.workspace}}/cpp-memory-pool-allocator
+
+    - name: Build Library, Tests, and Benchmarks
+      run: cmake --build ${{github.workspace}}/build --config ${{matrix.build_type}}
+
+    - name: Run Unit Tests
+      working-directory: ${{github.workspace}}/build
+      run: ctest -C ${{matrix.build_type}} --output-on-failure
