@@ -1,6 +1,6 @@
-# ============================================================================
+# ==========================================================================
 # CMakeLists.txt - Build Configuration for Custom C++ Memory Pool Allocator
-# ============================================================================
+# ==========================================================================
 # Why CMake?
 # - CMake is the industry-standard cross-platform build system generator for C++.
 # - It provides seamless integration with IDEs (Visual Studio, CLion, VS Code).
