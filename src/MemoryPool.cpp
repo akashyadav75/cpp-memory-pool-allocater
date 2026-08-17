@@ -1,0 +1,339 @@
+#include "MemoryPool.hpp"
+#include <iostream>
+#include <algorithm>
+#include <new>
+
+// Platform-specific headers for VirtualAlloc / mmap
+#if defined(_WIN32) || defined(_WIN64)
+    #define WIN32_LEAN_AND_MEAN
+    #include <windows.h>
+#else
+    #include <sys/mman.h>
+    #include <unistd.h>
+#endif
+
+/**
+ * @brief Constructor for the Memory Pool.
+ */
+MemoryPool::MemoryPool(size_t defaultSlabSize, bool threadSafe)
+    : m_defaultSlabSize(defaultSlabSize),
+      m_threadSafe(threadSafe),
+      m_freeListHead(nullptr),
+      m_totalCapacity(0),
+      m_usedMemory(0) {
+    
+    // Ensure the default slab size is at least a page size.
+    // On most modern systems, the page size is 4KB (4096 bytes).
+    size_t pageSize = 4096;
+#if defined(_WIN32) || defined(_WIN64)
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    pageSize = sysInfo.dwPageSize;
+#else
+    pageSize = sysconf(_SC_PAGESIZE);
+#endif
+
+    if (m_defaultSlabSize < pageSize) {
+        m_defaultSlabSize = pageSize;
+    }
+    // Align default slab size to page boundary
+    m_defaultSlabSize = alignUp(m_defaultSlabSize, pageSize);
+}
+
+/**
+ * @brief Destructor. Releases all OS-allocated slabs back to the system.
+ */
+MemoryPool::~MemoryPool() {
+    // Acquire lock if thread-safe
+    std::unique_lock<std::mutex> lock(m_mutex, std::defer_lock);
+    if (m_threadSafe) {
+        lock.lock();
+    }
+
+    // Free all slabs back to the Operating System
+    for (const auto& slab : m_slabs) {
+        freeSlabToOS(slab);
+    }
+    m_slabs.clear();
+    m_freeListHead = nullptr;
+    m_totalCapacity = 0;
+    m_usedMemory = 0;
+}
+
+/**
+ * @brief Allocates a block of memory of the specified size.
+ * 
+ * Allocation Process:
+ * 1. Align the requested size to the boundary (e.g., 8 or 16 bytes).
+ * 2. Search the explicit free list for a block that can hold the request (First-Fit).
+ * 3. If a block is found:
+ *    a. Split the block if there is sufficient excess space (O(1)).
+ *    b. Remove the block from the free list.
+ *    c. Mark the block as allocated.
+ * 4. If no block is found:
+ *    a. Allocate a new large Slab from the OS using VirtualAlloc/mmap.
+ *    b. Initialize the Slab as a single large free block.
+ *    c. Split this new slab to satisfy the request.
+ *    d. Add the remaining split portion to the free list.
+ */
+void* MemoryPool::allocate(size_t size, size_t alignment) {
+    if (size == 0) {
+        return nullptr;
+    }
+
+    // Align the requested size to the alignment boundary
+    // Alignment must be a power of 2 (e.g., 8, 16, 32, 64)
+    size_t alignedSize = alignUp(size, alignment);
+
+    // Lock the pool if thread safety is enabled
+    std::unique_lock<std::mutex> lock(m_mutex, std::defer_lock);
+    if (m_threadSafe) {
+        lock.lock();
+    }
+
+    // Search the explicit free list (First-Fit strategy)
+    // Why First-Fit?
+    // - It is highly efficient in practice (O(1) average case) compared to Best-Fit (O(N)),
+    //   as it stops at the first block that fits.
+    // - Combined with coalescing, it minimizes external fragmentation effectively.
+    Block* current = m_freeListHead;
+    Block* foundBlock = nullptr;
+
+    while (current) {
+        if (current->size >= alignedSize) {
+            foundBlock = current;
+            break;
+        }
+        current = current->nextFree;
+    }
+
+    // If no block was found in the free list, allocate a new slab from the OS
+    if (!foundBlock) {
+        // We need enough space for the Block header metadata, the aligned request size,
+        // and some padding/alignment.
+        size_t requiredSlabSize = alignedSize + sizeof(Block);
+        size_t slabSizeToAllocate = std::max(m_defaultSlabSize, requiredSlabSize);
+
+        Slab newSlab = allocateSlabFromOS(slabSizeToAllocate);
+        if (!newSlab.address) {
+            // OS-level out of memory (VirtualAlloc/mmap returned failure)
+            return nullptr;
+        }
+
+        m_slabs.push_back(newSlab);
+        m_totalCapacity += newSlab.size;
+
+        // Initialize the new slab as a single large free block
+        Block* newBlock = ::new (newSlab.address) Block(newSlab.size - sizeof(Block));
+        newBlock->isFree = true;
+
+        // Add this new block to the free list
+        addToFreeList(newBlock);
+        foundBlock = newBlock;
+    }
+
+    // Try to split the block to avoid internal fragmentation
+    Block* remainingBlock = foundBlock->split(alignedSize);
+    if (remainingBlock) {
+        // If split succeeded, we have a new free block.
+        // We must add the new split block to the free list.
+        addToFreeList(remainingBlock);
+    }
+
+    // Remove the allocated block from the free list
+    removeFromFreeList(foundBlock);
+    foundBlock->isFree = false;
+
+    // Update statistics
+    m_usedMemory += foundBlock->size + sizeof(Block);
+
+    // Return the payload pointer to the user
+    return foundBlock->getPayload();
+}
+
+/**
+ * @brief Deallocates/frees an allocated block of memory.
+ * 
+ * Deallocation Process:
+ * 1. Convert payload pointer back to Block header pointer.
+ * 2. Mark the block as free.
+ * 3. Coalesce the block with physically adjacent neighbors (O(1)).
+ * 4. Add the resulting block to the explicit free list.
+ */
+void MemoryPool::free(void* ptr) {
+    if (!ptr) {
+        return;
+    }
+
+    // Retrieve block header from payload pointer
+    Block* block = Block::fromPayload(ptr);
+
+    // Lock the pool if thread safety is enabled
+    std::unique_lock<std::mutex> lock(m_mutex, std::defer_lock);
+    if (m_threadSafe) {
+        lock.lock();
+    }
+
+    // Guard against double-free
+    if (block->isFree) {
+        return;
+    }
+
+    // Update statistics
+    m_usedMemory -= (block->size + sizeof(Block));
+
+    // Mark the block as free
+    block->isFree = true;
+
+    // Coalesce physical neighbors to prevent fragmentation.
+    // Why coalesce immediately?
+    // - It provides deterministic O(1) deallocation latency.
+    // - It prevents the free list from filling up with tiny, fragmented blocks.
+    // Note: If physical neighbors are coalesced, we must remove those neighbors
+    // from the free list before merging, then add the final merged block to the free list.
+    
+    // Check if next physical block is free and merge
+    if (block->next && block->next->isFree) {
+        Block* nextBlock = block->next;
+        removeFromFreeList(nextBlock);
+        
+        block->size += sizeof(Block) + nextBlock->size;
+        block->next = nextBlock->next;
+        if (nextBlock->next) {
+            nextBlock->next->prev = block;
+        }
+    }
+
+    // Check if previous physical block is free and merge
+    if (block->prev && block->prev->isFree) {
+        Block* prevBlock = block->prev;
+        removeFromFreeList(prevBlock);
+        
+        prevBlock->size += sizeof(Block) + block->size;
+        prevBlock->next = block->next;
+        if (block->next) {
+            block->next->prev = prevBlock;
+        }
+        block = prevBlock;
+    }
+
+    // Add the final (possibly coalesced) block back to the explicit free list
+    addToFreeList(block);
+}
+
+/**
+ * @brief Allocates a large slab directly from the OS using VirtualAlloc/mmap.
+ * 
+ * Why VirtualAlloc/mmap?
+ * - VirtualAlloc is the low-level Windows API for managing virtual memory pages. It bypasses
+ *   the user-mode heap allocator, eliminating internal heap locking, tracking, and fragmentation.
+ * - mmap is the POSIX equivalent, allowing us to map anonymous pages directly into the process's address space.
+ * 
+ * Alternatives Considered & Why Rejected:
+ * 1. std::malloc / operator new:
+ *    - Why Rejected: They are backed by runtime libraries which allocate memory with their own
+ *      headers and alignment padding, leading to "double header" overhead (malloc header + our Block header).
+ * 2. HeapCreate / HeapAlloc (Windows):
+ *    - Why Rejected: Creating a private heap still relies on the Windows NT Heap Manager, which
+ *      performs its own internal fragmentation management and locking, adding latency.
+ */
+MemoryPool::Slab MemoryPool::allocateSlabFromOS(size_t size) {
+    Slab slab = {nullptr, 0};
+
+    // Round up size to page size to ensure clean virtual memory allocation
+    size_t pageSize = 4096;
+#if defined(_WIN32) || defined(_WIN64)
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+    pageSize = sysInfo.dwPageSize;
+#else
+    pageSize = sysconf(_SC_PAGESIZE);
+#endif
+    size_t alignedSize = alignUp(size, pageSize);
+
+#if defined(_WIN32) || defined(_WIN64)
+    // MEM_COMMIT: Allocates physical storage in memory or in the paging file.
+    // MEM_RESERVE: Reserves a range of the process's virtual address space without allocating physical storage.
+    // PAGE_READWRITE: Enables read-only or read-write access to the committed region of pages.
+    void* addr = VirtualAlloc(nullptr, alignedSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    // MAP_PRIVATE: Create a private copy-on-write mapping.
+    // MAP_ANONYMOUS: The mapping is not backed by any file; its contents are initialized to zero.
+    void* addr = mmap(nullptr, alignedSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (addr == MAP_FAILED) {
+        addr = nullptr;
+    }
+#endif
+
+    if (addr) {
+        slab.address = addr;
+        slab.size = alignedSize;
+    } else {
+        std::cerr << "[MemoryPool] Error: OS virtual memory allocation failed for size " << alignedSize << " bytes." << std::endl;
+    }
+
+    return slab;
+}
+
+/**
+ * @brief Frees an OS-allocated slab back to the system.
+ */
+void MemoryPool::freeSlabToOS(const Slab& slab) {
+    if (!slab.address || slab.size == 0) {
+        return;
+    }
+
+#if defined(_WIN32) || defined(_WIN64)
+    // MEM_RELEASE: Decommits and releases the specified region of pages.
+    // When releasing memory, the size parameter must be 0, and the address must be the base address.
+    if (!VirtualFree(slab.address, 0, MEM_RELEASE)) {
+        std::cerr << "[MemoryPool] Error: VirtualFree failed." << std::endl;
+    }
+#else
+    if (munmap(slab.address, slab.size) != 0) {
+        std::cerr << "[MemoryPool] Error: munmap failed." << std::endl;
+    }
+#endif
+}
+
+/**
+ * @brief Adds a block to the explicit doubly-linked free list.
+ * 
+ * Why explicit free list?
+ * - It contains ONLY free blocks. This means when searching for a free block, we do not have
+ *   to traverse allocated blocks, making allocation latency dependent only on the number of
+ *   free blocks (O(Free_Blocks)) rather than the total number of blocks (O(Total_Blocks)).
+ */
+void MemoryPool::addToFreeList(Block* block) {
+    if (!block) return;
+
+    // Insert at the head of the free list (LIFO order is simple and fast - O(1))
+    block->nextFree = m_freeListHead;
+    block->prevFree = nullptr;
+
+    if (m_freeListHead) {
+        m_freeListHead->prevFree = block;
+    }
+    m_freeListHead = block;
+}
+
+/**
+ * @brief Removes a block from the explicit doubly-linked free list.
+ */
+void MemoryPool::removeFromFreeList(Block* block) {
+    if (!block) return;
+
+    if (block->prevFree) {
+        block->prevFree->nextFree = block->nextFree;
+    } else {
+        // Block was the head of the free list
+        m_freeListHead = block->nextFree;
+    }
+
+    if (block->nextFree) {
+        block->nextFree->prevFree = block->prevFree;
+    }
+
+    block->nextFree = nullptr;
+    block->prevFree = nullptr;
+}
