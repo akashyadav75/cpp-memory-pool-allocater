@@ -28,10 +28,11 @@ jobs:
       uses: actions/checkout@v3
 
     - name: Configure CMake
-      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{matrix.build_type}}
+      run: cmake -B ${{github.workspace}}/cpp-memory-pool-allocator/build -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -S ${{github.workspace}}/cpp-memory-pool-allocator
+
     - name: Build Library, Tests, and Benchmarks
-      run: cmake --build ${{github.workspace}}/build --config ${{matrix.build_type}}
+      run: cmake --build ${{github.workspace}}/cpp-memory-pool-allocator/build --config ${{matrix.build_type}}
 
     - name: Run Unit Tests
-      working-directory: ${{github.workspace}}/build
+      working-directory: ${{github.workspace}}/cpp-memory-pool-allocator/build
       run: ctest -C ${{matrix.build_type}} --output-on-failure
