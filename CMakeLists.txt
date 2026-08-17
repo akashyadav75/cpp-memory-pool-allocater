@@ -1,6 +1,6 @@
-# ==========================================================================
+# ============================================================================
 # CMakeLists.txt - Build Configuration for Custom C++ Memory Pool Allocator
-# ==========================================================================
+# ============================================================================
 # Why CMake?
 # - CMake is the industry-standard cross-platform build system generator for C++.
 # - It provides seamless integration with IDEs (Visual Studio, CLion, VS Code).
@@ -55,9 +55,11 @@ enable_testing()
 
 # Unit Tests Target
 add_executable(test_allocations tests/test_allocations.cpp)
+target_include_directories(test_allocations PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_allocations PRIVATE memory_pool)
 add_test(NAME UnitTests COMMAND test_allocations)
 
 # Benchmarks Target
 add_executable(throughput_test benchmarks/throughput_test.cpp)
+target_include_directories(throughput_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(throughput_test PRIVATE memory_pool)
