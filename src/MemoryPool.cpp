@@ -7,6 +7,10 @@
 // Platform-specific headers for VirtualAlloc / mmap
 #if defined(_WIN32) || defined(_WIN64)
     #define WIN32_LEAN_AND_MEAN
+    // NOMINMAX prevents windows.h from defining the `min`/`max` macros, which
+    // would otherwise collide with and break calls to std::max/std::min below
+    // (e.g. expanding std::max(...) into invalid syntax at compile time).
+    #define NOMINMAX
     #include <windows.h>
 #else
     #include <sys/mman.h>
@@ -181,7 +185,7 @@ void* MemoryPool::allocate(size_t size, size_t alignment) {
         // worst-case alignment waste (up to `alignment - 1` bytes), and one extra
         // Block header in case that waste must be carved into its own free fragment.
         size_t requiredSlabSize = alignedSize + (sizeof(Block) * 2) + alignment;
-        size_t slabSizeToAllocate = std::max(m_defaultSlabSize, requiredSlabSize);
+        size_t slabSizeToAllocate = (std::max)(m_defaultSlabSize, requiredSlabSize);
 
         Slab newSlab = allocateSlabFromOS(slabSizeToAllocate);
         if (!newSlab.address) {
