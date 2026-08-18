@@ -311,7 +311,7 @@ void MemoryPool::free(void* ptr) {
             block->next->prev = prevBlock;
         }
         block = prevBlock;
-    }
+    }  
 
     // Add the final (possibly coalesced) block back to the explicit free list
     addToFreeList(block);
