@@ -27,7 +27,7 @@ constexpr int NUM_THREADS = 4;          // For multithreaded contention test
 // Helper function to format large numbers with commas
 void printFormattedNumber(long long val) {
     std::string s = std::to_string(val);
-    int n = s.length() - 3;
+    int n = static_cast<int>(s.length()) - 3;
     while (n > 0) {
         s.insert(n, ",");
         n -= 3;
