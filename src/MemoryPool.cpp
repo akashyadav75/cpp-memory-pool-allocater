@@ -2,6 +2,7 @@
 #include <iostream>
 #include <algorithm>
 #include <new>
+#include <cstdint>
 
 // Platform-specific headers for VirtualAlloc / mmap
 #if defined(_WIN32) || defined(_WIN64)
@@ -11,6 +12,48 @@
     #include <sys/mman.h>
     #include <unistd.h>
 #endif
+
+namespace {
+    /**
+     * @brief Describes how a candidate free Block must be carved so that the FINAL
+     * payload address handed back to the user satisfies a given alignment.
+     *
+     * Why is this needed?
+     * - Rounding up the requested SIZE (as done previously) does nothing to guarantee
+     *   that the actual returned POINTER is aligned. A block's payload address depends
+     *   on where its header happens to sit in memory, which has no relationship to the
+     *   payload size at all.
+     * - There are two distinct scenarios:
+     *   1. The block's OWN payload address is already aligned -> use it directly
+     *      (needsSplit = false). No extra header overhead is introduced.
+     *   2. The block's payload is misaligned -> we must carve off a small "front
+     *      waste" region (kept as its own free block, `frontWasteSize` bytes) so
+     *      that a brand-new Block header can begin exactly where
+     *      (newHeaderAddr + sizeof(Block)) is a multiple of `alignment`.
+     *      Note: because Block::split() can only place a new header AFTER the
+     *      current payload start, the earliest a new header can land is at the
+     *      current payload address itself (frontWasteSize == 0), never earlier -
+     *      which is why scenario 1 must be checked as a separate, explicit case.
+     */
+    struct AlignmentPlan {
+        bool needsSplit;
+        size_t frontWasteSize; // Only meaningful when needsSplit == true
+    };
+
+    AlignmentPlan computeAlignmentPlan(uintptr_t rawPayloadAddr, size_t alignment, size_t headerSize) {
+        if (rawPayloadAddr % alignment == 0) {
+            // Case 1: Already aligned - no carving needed.
+            return AlignmentPlan{false, 0};
+        }
+
+        // Case 2: Solve for the smallest front waste W >= 0 such that
+        // (rawPayloadAddr + W + headerSize) % alignment == 0.
+        uintptr_t addrIfZeroWaste = rawPayloadAddr + headerSize;
+        uintptr_t remainder = addrIfZeroWaste % alignment;
+        size_t frontWaste = (remainder == 0) ? 0 : static_cast<size_t>(alignment - remainder);
+        return AlignmentPlan{true, frontWaste};
+    }
+}
 
 /**
  * @brief Constructor for the Memory Pool.
@@ -81,8 +124,16 @@ void* MemoryPool::allocate(size_t size, size_t alignment) {
         return nullptr;
     }
 
-    // Align the requested size to the alignment boundary
-    // Alignment must be a power of 2 (e.g., 8, 16, 32, 64)
+    if (alignment == 0) {
+        alignment = 8;
+    }
+
+    // Align the requested size to the alignment boundary.
+    // Note: This alone does NOT guarantee the returned pointer is aligned -
+    // it only ensures the payload region's length is a clean multiple of
+    // `alignment`. Actual pointer alignment is guaranteed below by carving
+    // off any front waste needed so a Block header can start exactly where
+    // (header + sizeof(Block)) lands on an `alignment`-byte boundary.
     size_t alignedSize = alignUp(size, alignment);
 
     // Lock the pool if thread safety is enabled
@@ -96,22 +147,40 @@ void* MemoryPool::allocate(size_t size, size_t alignment) {
     // - It is highly efficient in practice (O(1) average case) compared to Best-Fit (O(N)),
     //   as it stops at the first block that fits.
     // - Combined with coalescing, it minimizes external fragmentation effectively.
+    //
+    // For each candidate, we also compute the AlignmentPlan describing whether/how much
+    // front waste must be carved off so the FINAL returned payload address satisfies the
+    // requested alignment. A block only qualifies if it has enough room for that waste,
+    // a fresh Block header (if needed), and the requested payload.
     Block* current = m_freeListHead;
     Block* foundBlock = nullptr;
+    AlignmentPlan foundPlan{false, 0};
 
     while (current) {
-        if (current->size >= alignedSize) {
+        uintptr_t rawPayload = reinterpret_cast<uintptr_t>(current->getPayload());
+        AlignmentPlan plan = computeAlignmentPlan(rawPayload, alignment, sizeof(Block));
+
+        bool fits = plan.needsSplit
+            ? (current->size >= plan.frontWasteSize + sizeof(Block) + alignedSize)
+            : (current->size >= alignedSize);
+
+        if (fits) {
             foundBlock = current;
+            foundPlan = plan;
             break;
         }
         current = current->nextFree;
     }
 
+    // Tracks whether `foundBlock` is currently registered in the explicit free list.
+    bool foundInFreeList = false;
+
     // If no block was found in the free list, allocate a new slab from the OS
     if (!foundBlock) {
-        // We need enough space for the Block header metadata, the aligned request size,
-        // and some padding/alignment.
-        size_t requiredSlabSize = alignedSize + sizeof(Block);
+        // We need enough space for: the aligned request size, a Block header for it,
+        // worst-case alignment waste (up to `alignment - 1` bytes), and one extra
+        // Block header in case that waste must be carved into its own free fragment.
+        size_t requiredSlabSize = alignedSize + (sizeof(Block) * 2) + alignment;
         size_t slabSizeToAllocate = std::max(m_defaultSlabSize, requiredSlabSize);
 
         Slab newSlab = allocateSlabFromOS(slabSizeToAllocate);
@@ -129,7 +198,27 @@ void* MemoryPool::allocate(size_t size, size_t alignment) {
 
         // Add this new block to the free list
         addToFreeList(newBlock);
+
+        // Recompute the alignment plan for this freshly-created block.
+        uintptr_t rawPayload = reinterpret_cast<uintptr_t>(newBlock->getPayload());
+        foundPlan = computeAlignmentPlan(rawPayload, alignment, sizeof(Block));
         foundBlock = newBlock;
+    }
+
+    foundInFreeList = true;
+
+    // If the plan calls for carving off front waste, do so now. The resulting
+    // `alignedBlock` is a brand-new, not-yet-registered Block whose payload is
+    // guaranteed to satisfy the requested alignment. The original `foundBlock`
+    // shrinks down to the waste region and correctly remains a free block right
+    // where it already sits in the free list (Block::split() only touches
+    // physical next/prev links, never the explicit free-list pointers).
+    if (foundPlan.needsSplit) {
+        Block* alignedBlock = foundBlock->split(foundPlan.frontWasteSize);
+        // Guaranteed non-null: we verified sufficient size for waste + header +
+        // payload before selecting this block.
+        foundBlock = alignedBlock;
+        foundInFreeList = false; // alignedBlock was never registered in the free list
     }
 
     // Try to split the block to avoid internal fragmentation
@@ -140,15 +229,18 @@ void* MemoryPool::allocate(size_t size, size_t alignment) {
         addToFreeList(remainingBlock);
     }
 
-    // Remove the allocated block from the free list
-    removeFromFreeList(foundBlock);
+    // Remove the allocated block from the free list (only if it was actually in it)
+    if (foundInFreeList) {
+        removeFromFreeList(foundBlock);
+    }
     foundBlock->isFree = false;
 
     // Update statistics
     m_usedMemory += foundBlock->size + sizeof(Block);
 
-    // Return the payload pointer to the user
-    return foundBlock->getPayload();
+    // Return the payload pointer to the user - now guaranteed to satisfy `alignment`.
+    void* result = foundBlock->getPayload();
+    return result;
 }
 
 /**
