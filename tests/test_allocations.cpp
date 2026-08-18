@@ -54,6 +54,7 @@ void test_alignment() {
         // Verify that the pointer is aligned to the requested boundary
         uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
         assert((addr % align) == 0);
+        (void)addr; // Prevent unused variable warning in Release builds
 
         pool.free(ptr);
     }
@@ -68,6 +69,7 @@ void test_edge_cases() {
     // 1. Zero size allocation should return nullptr
     void* pZero = pool.allocate(0);
     assert(pZero == nullptr);
+    (void)pZero; // Prevent unused variable warning
 
     // 2. Freeing a nullptr should be safe and do nothing
     pool.free(nullptr);
@@ -77,6 +79,7 @@ void test_edge_cases() {
     size_t hugeSize = 100ULL * 1024ULL * 1024ULL * 1024ULL * 1024ULL;
     void* pHuge = pool.allocate(hugeSize);
     assert(pHuge == nullptr);
+    (void)pHuge; // Prevent unused variable warning
 }
 
 /**
