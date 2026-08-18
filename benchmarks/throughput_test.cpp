@@ -4,6 +4,7 @@
 #include <vector>
 #include <thread>
 #include <iomanip>
+#include <string>
 
 /**
  * @brief Benchmark test comparing Custom Memory Pool vs. Standard malloc/free.
